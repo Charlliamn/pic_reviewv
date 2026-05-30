@@ -56,10 +56,7 @@ def find_workbook(workbook_arg: str | None) -> Path:
     candidates = [p for p in Path(".").glob("*.xlsx") if not p.name.startswith("~$")]
     if not candidates:
         raise FileNotFoundError("当前目录没有找到 .xlsx 文件")
-    if len(candidates) > 1:
-        names = ", ".join(str(p) for p in candidates)
-        raise RuntimeError(f"找到多个 .xlsx，请用 --workbook 指定一个：{names}")
-    return candidates[0]
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def load_env_file(path: Path = Path(".env")) -> None:
@@ -136,8 +133,6 @@ def image_extension_and_mime(img: Any, data: bytes) -> tuple[str, str]:
 
 def extract_images(workbook: Path, output_dir: Path) -> list[ExtractedImage]:
     wb = openpyxl.load_workbook(workbook, data_only=True)
-    image_root = output_dir / "images"
-    image_root.mkdir(parents=True, exist_ok=True)
     extracted: list[ExtractedImage] = []
 
     for ws in wb.worksheets:
@@ -182,13 +177,14 @@ def extract_images(workbook: Path, output_dir: Path) -> list[ExtractedImage]:
                 img = item["img"]
                 data = image_bytes(img)
                 ext, mime_type = image_extension_and_mime(img, data)
-                sheet_dir = image_root / safe_name(ws.title)
-                sheet_dir.mkdir(parents=True, exist_ok=True)
+                sheet_dir = output_dir / safe_name(ws.title)
+                image_dir = sheet_dir / "images"
+                image_dir.mkdir(parents=True, exist_ok=True)
                 filename = (
                     f"{safe_name(ws.title)}_row{row:04d}_no{safe_name(record_no)}"
                     f"_image{image_index}.{ext}"
                 )
-                file_path = sheet_dir / filename
+                file_path = image_dir / filename
                 file_path.write_bytes(data)
 
                 extracted.append(
@@ -208,6 +204,13 @@ def extract_images(workbook: Path, output_dir: Path) -> list[ExtractedImage]:
                 )
 
     return extracted
+
+
+def group_images_by_sheet(images: list[ExtractedImage]) -> dict[str, list[ExtractedImage]]:
+    groups: dict[str, list[ExtractedImage]] = {}
+    for image in images:
+        groups.setdefault(image.sheet, []).append(image)
+    return groups
 
 
 def parse_json_response(text: str) -> dict[str, Any]:
@@ -375,9 +378,19 @@ def write_manifest(images: list[ExtractedImage], output_dir: Path) -> Path:
 
 
 def write_excel(results: list[dict[str, Any]], output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "analysis"
+    append_results_to_sheet(ws, results)
+    adjust_sheet_widths(ws)
+
+    path = output_dir / "analysis_results.xlsx"
+    wb.save(path)
+    return path
+
+
+def append_results_to_sheet(ws: Any, results: list[dict[str, Any]]) -> None:
     headers = [
         "sheet",
         "excel_row",
@@ -394,6 +407,7 @@ def write_excel(results: list[dict[str, Any]], output_dir: Path) -> Path:
         "错误",
     ]
     ws.append(headers)
+
     for item in results:
         analysis = item.get("analysis") or {}
         objects = analysis.get("objects", "")
@@ -417,20 +431,50 @@ def write_excel(results: list[dict[str, Any]], output_dir: Path) -> Path:
             ]
         )
 
+
+def adjust_sheet_widths(ws: Any) -> None:
     for col in ws.columns:
         letter = col[0].column_letter
         ws.column_dimensions[letter].width = min(max(len(str(cell.value or "")) for cell in col) + 2, 60)
 
-    path = output_dir / "analysis_results.xlsx"
+
+def write_combined_excel(results_by_sheet: dict[str, list[dict[str, Any]]], output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    used_titles: set[str] = set()
+    source = results_by_sheet or {"analysis": []}
+    for sheet_name, results in source.items():
+        title = unique_excel_sheet_title(sheet_name, used_titles)
+        ws = wb.create_sheet(title=title)
+        append_results_to_sheet(ws, results)
+        adjust_sheet_widths(ws)
+
+    path = output_dir / "analysis_results_by_document.xlsx"
     wb.save(path)
     return path
+
+
+def unique_excel_sheet_title(value: Any, used_titles: set[str]) -> str:
+    title = str(value or "analysis").strip()
+    title = re.sub(r"[\[\]:*?/\\]", "_", title)
+    title = title[:31].strip() or "analysis"
+    base = title
+    index = 2
+    while title in used_titles:
+        suffix = f"_{index}"
+        title = f"{base[:31 - len(suffix)]}{suffix}"
+        index += 1
+    used_titles.add(title)
+    return title
 
 
 def main() -> int:
     load_env_file()
 
     parser = argparse.ArgumentParser(description="读取 xlsx 中图片列的图片，并调用视觉 API 分析。")
-    parser.add_argument("--workbook", help="xlsx 文件路径；不传则自动使用当前目录唯一的 .xlsx")
+    parser.add_argument("--workbook", help="xlsx 文件路径；不传则自动使用当前目录最近修改的 .xlsx")
     parser.add_argument("--output-dir", default="output", help="输出目录")
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", DEFAULT_MODEL), help="视觉模型名")
     parser.add_argument(
@@ -449,26 +493,48 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"使用 xlsx：{workbook}")
     images = extract_images(workbook, output_dir)
-    manifest_path = write_manifest(images, output_dir)
-    print(f"已抽取 {len(images)} 张图片，清单：{manifest_path}")
+    images_by_sheet = group_images_by_sheet(images)
+    print(f"已抽取 {len(images)} 张图片，分文档输出到：{output_dir}")
+    for sheet, sheet_images in images_by_sheet.items():
+        sheet_output_dir = output_dir / safe_name(sheet)
+        manifest_path = write_manifest(sheet_images, sheet_output_dir)
+        print(f"  {sheet}: {len(sheet_images)} 张图片，清单：{manifest_path}")
 
     if args.extract_only:
         return 0
 
-    results = analyze_images(
-        images=images,
-        output_dir=output_dir,
-        model=args.model,
-        base_url=args.base_url,
-        limit=args.limit,
-        sleep_seconds=args.sleep,
-        max_retries=args.max_retries,
-        resume=not args.no_resume,
-    )
-    excel_path = write_excel(results, output_dir)
-    print(f"分析完成：{output_dir / 'analysis_results.jsonl'}")
-    print(f"Excel 汇总：{excel_path}")
+    remaining_limit = args.limit
+    results_by_sheet: dict[str, list[dict[str, Any]]] = {}
+    for sheet, sheet_images in images_by_sheet.items():
+        if remaining_limit is not None and remaining_limit <= 0:
+            break
+
+        sheet_limit = None
+        if remaining_limit is not None:
+            sheet_limit = min(remaining_limit, len(sheet_images))
+            remaining_limit -= sheet_limit
+
+        sheet_output_dir = output_dir / safe_name(sheet)
+        print(f"开始分析文档：{sheet}")
+        results = analyze_images(
+            images=sheet_images,
+            output_dir=sheet_output_dir,
+            model=args.model,
+            base_url=args.base_url,
+            limit=sheet_limit,
+            sleep_seconds=args.sleep,
+            max_retries=args.max_retries,
+            resume=not args.no_resume,
+        )
+        results_by_sheet[sheet] = results
+        excel_path = write_excel(results, sheet_output_dir)
+        print(f"分析完成：{sheet_output_dir / 'analysis_results.jsonl'}")
+        print(f"Excel 输出：{excel_path}")
+
+    combined_excel_path = write_combined_excel(results_by_sheet, output_dir)
+    print(f"多 sheet Excel 总表：{combined_excel_path}")
     return 0
 
 
